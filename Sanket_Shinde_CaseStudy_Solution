@@ -1,0 +1,231 @@
+StockFlow – Backend Engineering Case Study
+
+Part 1: Code Review & Debugging:
+❌ Problems in the Given API (Conceptual – Language Independent)
+Technical Issues
+1.	No request validation
+2.	SKU uniqueness not enforced
+3.	Multiple DB commits (non-atomic)
+4.	No error handling
+5.	Float used for price
+6.	No transaction rollback
+7.	Hard crash if field missing
+8.	No HTTP status codes
+Business Logic Issues
+9.	Product wrongly tied to one warehouse
+10.	Inventory duplication possible
+11.	Negative quantity allowed
+12.	Optional fields not supported
+________________________________________
+✅ Corrected Implementation (Node.js + Express)
+Assumptions
+•	Sequelize ORM
+•	PostgreSQL/MySQL
+•	SKU has UNIQUE constraint
+•	Price stored as DECIMAL
+✅ Fixed /api/products Endpoint:
+const express = require("express");
+const router = express.Router();
+const { sequelize, Product, Inventory } = require("../models");
+
+router.post("/api/products", async (req, res) => {
+  const { name, sku, price, warehouse_id, initial_quantity } = req.body;
+
+  if (!name || !sku || price === undefined) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  const transaction = await sequelize.transaction();
+
+  try {
+    const product = await Product.create(
+      {
+        name,
+        sku,
+        price: Number(price)
+      },
+      { transaction }
+    );
+
+    if (warehouse_id && initial_quantity !== undefined) {
+      await Inventory.create(
+        {
+          product_id: product.id,
+          warehouse_id,
+          quantity: Math.max(0, initial_quantity)
+        },
+        { transaction }
+      );
+    }
+
+    await transaction.commit();
+
+    return res.status(201).json({
+      message: "Product created successfully",
+      product_id: product.id
+    });
+  } catch (error) {
+    await transaction.rollback();
+
+    if (error.name === "SequelizeUniqueConstraintError") {
+      return res.status(409).json({ error: "SKU already exists" });
+    }
+
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+module.exports = router;
+
+✅ Why This is Production-Ready
+•	Atomic transaction
+•	Proper HTTP codes
+•	SKU uniqueness enforced
+•	Supports multi-warehouse
+•	Safe numeric handling
+•	Graceful failure
+Part 2: Database Design:
+Schema (SQL-style):
+companies:
+id BIGINT PRIMARY KEY
+name VARCHAR(255)
+created_at TIMESTAMP
+
+warehouses:
+id BIGINT PRIMARY KEY
+company_id BIGINT REFERENCES companies(id)
+name VARCHAR(255)
+location VARCHAR(255)
+
+products:
+id BIGINT PRIMARY KEY
+company_id BIGINT REFERENCES companies(id)
+name VARCHAR(255)
+sku VARCHAR(100) UNIQUE
+price DECIMAL(10,2)
+product_type VARCHAR(50)
+
+inventory:
+id BIGINT PRIMARY KEY
+product_id BIGINT REFERENCES products(id)
+warehouse_id BIGINT REFERENCES warehouses(id)
+quantity INT CHECK (quantity >= 0)
+UNIQUE(product_id, warehouse_id)
+
+inventory_movements:
+id BIGINT PRIMARY KEY
+inventory_id BIGINT REFERENCES inventory(id)
+change INT
+reason VARCHAR(100)
+created_at TIMESTAMP
+
+suppliers:
+id BIGINT PRIMARY KEY
+name VARCHAR(255)
+contact_email VARCHAR(255)
+
+product_suppliers:
+product_id BIGINT REFERENCES products(id)
+supplier_id BIGINT REFERENCES suppliers(id)
+PRIMARY KEY(product_id, supplier_id)
+
+product_bundles:
+bundle_id BIGINT REFERENCES products(id)
+component_id BIGINT REFERENCES products(id)
+quantity INT
+
+Missing Requirement Questions:
+1.	Can products be shared across companies?
+2.	How is “recent sales” defined (days)?
+3.	Are thresholds warehouse-specific?
+4.	Can a product have multiple suppliers?
+5.	Can bundles contain bundles?
+6.	Should deleted products keep inventory history?
+7.	Is inventory reservation needed?
+
+Part 3: Low-Stock Alerts API:
+Endpoint:
+GET /api/companies/:companyId/alerts/low-stock
+Assumptions
+•	Recent sales = last 30 days
+•	Threshold depends on product_type
+•	One primary supplier per product
+•	Average daily sales used for prediction
+
+ Node.js + Express Implementation:
+
+router.get(
+  "/api/companies/:companyId/alerts/low-stock",
+  async (req, res) => {
+    const { companyId } = req.params;
+
+    try {
+      const inventories = await Inventory.findAll({
+        include: [
+          {
+            model: Product,
+            where: { company_id: companyId },
+            include: [{ model: Supplier }]
+          },
+          { model: Warehouse }
+        ]
+      });
+
+      const alerts = [];
+
+      for (const inv of inventories) {
+        const product = inv.Product;
+        const warehouse = inv.Warehouse;
+        const supplier = product.Suppliers?.[0];
+
+        const threshold = getThreshold(product.product_type);
+        const recentSales = await getRecentSales(product.id, 30);
+
+        if (recentSales === 0) continue;
+
+        const avgDailySales = recentSales / 30;
+        const daysUntilStockout = Math.floor(
+          inv.quantity / avgDailySales
+        );
+
+        if (inv.quantity < threshold) {
+          alerts.push({
+            product_id: product.id,
+            product_name: product.name,
+            sku: product.sku,
+            warehouse_id: warehouse.id,
+            warehouse_name: warehouse.name,
+            current_stock: inv.quantity,
+            threshold,
+            days_until_stockout: daysUntilStockout,
+            supplier: supplier
+              ? {
+                  id: supplier.id,
+                  name: supplier.name,
+                  contact_email: supplier.contact_email
+                }
+              : null
+          });
+        }
+      }
+
+      return res.status(200).json({
+        alerts,
+        total_alerts: alerts.length
+      });
+    } catch (err) {
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
+Edge Cases Handled:
+✔ No recent sales
+✔ Multiple warehouses
+✔ Divide-by-zero avoided
+✔ Missing supplier safe
+✔ Company isolation
+
+
+
+
